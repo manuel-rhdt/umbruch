@@ -193,7 +193,8 @@ fn colors_and_line_styles_are_set_when_they_change() {
     );
     assert_eq!(count(&r.pdf, "1 0 0 rg"), 1, "{}", r.pdf);
     assert_eq!(count(&r.pdf, "0 0 0 RG"), 1, "{}", r.pdf);
-    assert_eq!(count(&r.pdf, "2 w"), 1, "{}", r.pdf);
+    // Shared subscenes write coordinates in points, as the page painter does.
+    assert_eq!(count(&r.pdf, "1.5 w"), 1, "{}", r.pdf);
     // the paths need no `q` and `Q` of their own: the one of the page, and the one that scopes
     // the form's clip of the image
     assert!(count(&r.pdf, " q ") + count(&r.pdf, "\nq ") <= 3, "{}", r.pdf);

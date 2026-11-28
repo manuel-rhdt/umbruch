@@ -77,11 +77,24 @@ impl MarkedContent {
 
 type PageContext<'p, 'c, 'b> = lemon_pdf::content::PageContext<'p, 'c, 'b>;
 
-/// How an image is embedded: raster images as an image XObject, SVG images as a form.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum EmbeddedKey {
+    Image(*const crate::image::LoadedImage),
+    Subscene(*const display_list::Subscene),
+}
+
 enum Embedded {
     Raster(IndirectReference<lemon_pdf::image::ImageXObject>),
-    /// An SVG image as a form, with its size.
-    Svg(lemon_pdf::form::FormReference, f32, f32, bool),
+    Form(lemon_pdf::form::FormReference),
+}
+
+type EmbeddedObjects = HashMap<EmbeddedKey, Embedded>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SolidPaint {
+    fill: Option<PaintColor>,
+    stroke: Option<PaintColor>,
+    stroke_style: Option<display_list::PathStroke>,
 }
 
 /// The opacity (`ca` and `CA`) that is set in the graphics state of the content stream being
@@ -92,14 +105,48 @@ struct Alpha {
     /// `UNKNOWN` after something that changes the opacity without restoring it.
     fill: u16,
     stroke: u16,
-    saved: Vec<(u16, u16)>,
+    solid_paint: Option<SolidPaint>,
+    saved: Vec<(u16, u16, Option<SolidPaint>)>,
 }
 
 impl Alpha {
     const UNKNOWN: u16 = u16::MAX;
 
-    fn new() -> Self {
-        Alpha { fill: u16::from(u8::MAX), stroke: u16::from(u8::MAX), saved: vec![] }
+    fn new(compact: bool) -> Self {
+        Alpha {
+            fill: u16::from(u8::MAX), stroke: u16::from(u8::MAX),
+            solid_paint: compact.then(SolidPaint::default), saved: vec![],
+        }
+    }
+
+    fn forget_solid_paint(&mut self) {
+        if let Some(paint) = &mut self.solid_paint {
+            *paint = SolidPaint::default();
+        }
+    }
+
+    fn set_ink(&mut self, context: &mut PageContext<'_, '_, '_>, color: PaintColor, stroke: bool) -> Result<(), Error> {
+        if let Some(paint) = &mut self.solid_paint {
+            let current = if stroke { &mut paint.stroke } else { &mut paint.fill };
+            if *current == Some(color) {
+                return Ok(());
+            }
+            *current = Some(color);
+        }
+        set_color(context, color, stroke)
+    }
+
+    fn set_path_stroke(&mut self, context: &mut PageContext<'_, '_, '_>, style: display_list::PathStroke) -> Result<(), Error> {
+        if let Some(paint) = &mut self.solid_paint {
+            if paint.stroke_style == Some(style) {
+                return Ok(());
+            }
+            paint.stroke_style = Some(style);
+        }
+        context.line_width(style.width.into())?;
+        context.line_cap(crate::svg::pdf_line_cap(style.cap))?;
+        context.line_join(crate::svg::pdf_line_join(style.join))?;
+        context.miter_limit(f64::from(style.miter_limit))
     }
 
     /// Forgets the opacity: the next colour or `reset` writes it again.
@@ -109,13 +156,14 @@ impl Alpha {
     }
 
     fn push(&mut self) {
-        self.saved.push((self.fill, self.stroke));
+        self.saved.push((self.fill, self.stroke, self.solid_paint));
     }
 
     fn pop(&mut self) {
-        if let Some((fill, stroke)) = self.saved.pop() {
+        if let Some((fill, stroke, solid_paint)) = self.saved.pop() {
             self.fill = fill;
             self.stroke = stroke;
+            self.solid_paint = solid_paint;
         }
     }
 
@@ -331,7 +379,7 @@ fn paint_items(
     filter: Option<StreamFilter>,
     font_map: &HashMap<String, font::EmbeddedFont>,
     usage: &FontUsage,
-    images: &HashMap<*const crate::image::LoadedImage, Embedded>,
+    images: &EmbeddedObjects,
     color_glyphs: &std::cell::RefCell<color_glyph::ColorGlyphs>,
     tagged: bool,
     recorder: &mut Option<TagRecorder>,
@@ -350,6 +398,7 @@ fn paint_items(
         tagged,
         recorder,
         page_index,
+        false,
     )
 }
 
@@ -363,13 +412,14 @@ fn paint_slice(
     filter: Option<StreamFilter>,
     font_map: &HashMap<String, font::EmbeddedFont>,
     usage: &FontUsage,
-    images: &HashMap<*const crate::image::LoadedImage, Embedded>,
+    images: &EmbeddedObjects,
     color_glyphs: &std::cell::RefCell<color_glyph::ColorGlyphs>,
     tagged: bool,
     recorder: &mut Option<TagRecorder>,
     page_index: usize,
+    compact: bool,
 ) -> Result<(), Error> {
-    let mut alpha = Alpha::new();
+    let mut alpha = Alpha::new(compact);
     let mut remaining = items.iter().copied();
     while let Some(item) = remaining.next() {
         match item {
@@ -423,6 +473,7 @@ fn paint_slice(
                             false,
                             &mut None,
                             page_index,
+                            compact,
                         )
                     },
                 )?;
@@ -474,7 +525,7 @@ fn paint_item(
     filter: Option<StreamFilter>,
     font_map: &HashMap<String, font::EmbeddedFont>,
     usage: &FontUsage,
-    images: &HashMap<*const crate::image::LoadedImage, Embedded>,
+    images: &EmbeddedObjects,
     color_glyphs: &std::cell::RefCell<color_glyph::ColorGlyphs>,
     tagged: bool,
     recorder: &mut Option<TagRecorder>,
@@ -515,11 +566,11 @@ fn paint_item(
                 page_context.concatenate_matrix(1.0, 0.0, 0.0, 1.0, x.into(), y.into())?;
             }
             &DisplayItem::Color(color) => {
-                set_fill_color(page_context, color)?;
+                alpha.set_ink(page_context, color, false)?;
                 alpha.set_fill(page_context, color.alpha())?;
             }
             &DisplayItem::StrokeColor(color) => {
-                set_stroke_color(page_context, color)?;
+                alpha.set_ink(page_context, color, true)?;
                 alpha.set_stroke(page_context, color.alpha())?;
             }
             &DisplayItem::LineString {
@@ -545,8 +596,26 @@ fn paint_item(
                     page_context.line_to(x, y)?
                 }
 
+                if let Some(paint) = &mut alpha.solid_paint {
+                    paint.stroke_style = None;
+                }
                 page_context.line_width(line_width.into())?;
                 page_context.stroke_path()?;
+                page_context.apply_operator("EMC")?;
+            }
+            DisplayItem::StrokePath { path, style } => {
+                page_context.push_operand(RawPdf("/Artifact".into()))?;
+                page_context.apply_operator("BMC")?;
+                let scoped = alpha.solid_paint.is_none();
+                if scoped {
+                    page_context.save_graphics_state()?;
+                }
+                alpha.set_path_stroke(page_context, *style)?;
+                emit_path(page_context, path, page_height)?;
+                page_context.stroke_path()?;
+                if scoped {
+                    page_context.restore_graphics_state()?;
+                }
                 page_context.apply_operator("EMC")?;
             }
             DisplayItem::FillPath { path, even_odd } => {
@@ -581,9 +650,10 @@ fn paint_item(
                 gradient::paint(page_context, resolved, page_height, filter)?;
                 // a gradient without a clip leaves its opacity set
                 alpha.invalidate();
+                alpha.forget_solid_paint();
             }
             DisplayItem::Image { rect, image } => {
-                let Some(embedded) = images.get(&std::sync::Arc::as_ptr(image)) else {
+                let Some(embedded) = images.get(&EmbeddedKey::Image(std::sync::Arc::as_ptr(image))) else {
                     return Ok(());
                 };
                 alpha.reset(page_context)?;
@@ -600,18 +670,14 @@ fn paint_item(
                             Pt::from(rect.height),
                         )?;
                     }
-                    Embedded::Svg(form, width, height, unscaled) => {
-                        // like `object-fit: contain`: the SVG keeps its proportions
-                        // and is centered in the box (an element without a `viewBox` keeps its
-                        // scale and the corner, and what is outside of the box is clipped)
-                        let (box_w, box_h) = (rect.width.0, rect.height.0);
-                        let scale = if unscaled { 1.0 } else { (box_w / width).min(box_h / height) };
-                        let (free_w, free_h) =
-                            if unscaled { (0.0, 0.0) } else { (box_w - width * scale, box_h - height * scale) };
-                        // layout is in pixels, the PDF in points
-                        let x = Pt::from(rect.x + PixelLength(free_w / 2.0));
-                        let y = Pt::from(page_height - rect.y - PixelLength(free_h / 2.0));
-                        let scale = f64::from(Pt::from(PixelLength(scale)).0);
+                    Embedded::Form(form) => {
+                        let crate::image::LoadedImage::Svg(svg) = &**image else {
+                            unreachable!("SVG form paired with a raster image");
+                        };
+                        let (scale, origin) = svg.placement(*rect);
+                        let x = Pt::from(origin.x);
+                        let y = Pt::from(page_height - origin.y);
+                        let scale = Pt::from(PixelLength(scale)).0;
                         let key = page_context.add_xobject(form);
                         page_context.save_graphics_state()?;
                         page_context.rect(
@@ -635,6 +701,31 @@ fn paint_item(
                         page_context.restore_graphics_state()?;
                     }
                 }
+                page_context.apply_operator("EMC")?;
+            }
+            DisplayItem::DrawSubscene { scene, transform, clip } => {
+                let key = EmbeddedKey::Subscene(std::sync::Arc::as_ptr(scene));
+                let Some(Embedded::Form(form)) = images.get(&key) else { return Ok(()) };
+                alpha.reset(page_context)?;
+                page_context.push_operand(RawPdf("/Artifact".into()))?;
+                page_context.apply_operator("BMC")?;
+                page_context.save_graphics_state()?;
+                page_context.rect(
+                    Pt::from(clip.x), Pt::from(page_height - clip.y - clip.height),
+                    Pt::from(clip.width), Pt::from(clip.height),
+                )?;
+                page_context.clip(lemon_pdf::graphics_state::FillRule::NonZero)?;
+                page_context.end_path()?;
+                // Both the Form and page are in points with y up. The source transform uses CSS pixels with y down.
+                let [a, b, c, d, e, f] = transform.map(f64::from);
+                let h = f64::from(scene.height.0);
+                page_context.concatenate_matrix(
+                    a, -b, -c, d, Pt(0.75 * (e + c * h)),
+                    Pt(0.75 * (f64::from(page_height.0) - f - d * h)),
+                )?;
+                let name = page_context.add_xobject(*form);
+                page_context.draw_xobject(&name)?;
+                page_context.restore_graphics_state()?;
                 page_context.apply_operator("EMC")?;
             }
             DisplayItem::BlendGroup(group) => {
@@ -694,7 +785,7 @@ fn paint_item(
                             }
                         }
                         &TextOperator::SetColor(color) => {
-                            set_fill_color(page_context, color)?;
+                            alpha.set_ink(page_context, color, false)?;
                             alpha.set_fill(page_context, color.alpha())?;
                         }
                         &TextOperator::KernedGlyphs(range) => {
@@ -841,33 +932,49 @@ pub(crate) fn write_raster(
     context.write_image(pdf_image).map_err(|error| error.to_string())
 }
 
-/// Embeds the images of the items of a display list that are not embedded yet.
-fn embed_images(
+/// Embeds the images and subscenes needed by the display items.
+#[allow(clippy::too_many_arguments)]
+fn embed_items<'a>(
     context: &mut DocumentContext<'_>,
-    display_list: &mut display_list::DisplayList,
-    images: &mut HashMap<*const crate::image::LoadedImage, Embedded>,
+    items: impl Iterator<Item = &'a DisplayItem>,
+    images: &mut EmbeddedObjects,
     svg_writer: &mut crate::svg::SvgWriter,
+    filter: Option<StreamFilter>,
+    font_map: &HashMap<String, font::EmbeddedFont>,
+    usage: &FontUsage,
+    color_glyphs: &std::cell::RefCell<color_glyph::ColorGlyphs>,
 ) {
-    for item in display_list.items() {
-        let DisplayItem::Image { image, .. } = item else {
-            continue;
-        };
-        let key = std::sync::Arc::as_ptr(image);
-        if images.contains_key(&key) {
-            continue;
-        }
-        let embedded = match &**image {
-            crate::image::LoadedImage::Raster(raster) => write_raster(context, raster).map(Embedded::Raster),
-            crate::image::LoadedImage::Svg(svg) => svg_writer
-                .write(context, &svg.tree, svg.unscaled)
-                .map(|form| Embedded::Svg(form, svg.tree.size().width(), svg.tree.size().height(), svg.unscaled))
-                .map_err(|error| error.to_string()),
+    for item in items {
+        let (key, embedded) = match item {
+            DisplayItem::Image { image, .. } => {
+                let key = EmbeddedKey::Image(std::sync::Arc::as_ptr(image));
+                if images.contains_key(&key) { continue; }
+                let embedded = match &**image {
+                    crate::image::LoadedImage::Raster(raster) => write_raster(context, raster).map(Embedded::Raster),
+                    crate::image::LoadedImage::Svg(svg) => svg_writer.write(context, svg)
+                        .map(Embedded::Form)
+                        .map_err(|error| error.to_string()),
+                };
+                (key, embedded)
+            }
+            DisplayItem::DrawSubscene { scene, .. } => {
+                let key = EmbeddedKey::Subscene(std::sync::Arc::as_ptr(scene));
+                if images.contains_key(&key) { continue; }
+                embed_items(context, scene.items.iter(), images, svg_writer, filter, font_map, usage, color_glyphs);
+                let items: Vec<_> = scene.items.iter().collect();
+                let embedded = context.write_form(
+                    [Pt(0.0), Pt(0.0), scene.width.into(), scene.height.into()], None, filter, |form| {
+                        set_device_defaults(form)?;
+                        paint_slice(form, &items, scene.height, filter, font_map, usage, images, color_glyphs, false, &mut None, 0, true)
+                    },
+                ).map(Embedded::Form).map_err(|error| error.to_string());
+                (key, embedded)
+            }
+            _ => continue,
         };
         match embedded {
-            Ok(embedded) => {
-                images.insert(key, embedded);
-            }
-            Err(error) => log::warn!("cannot embed an image: {}", error),
+            Ok(embedded) => { images.insert(key, embedded); }
+            Err(error) => log::warn!("cannot embed an image or subscene: {}", error),
         }
     }
 }
@@ -1116,7 +1223,7 @@ fn write_pdf_to<W: Write>(
     }
 
     // Every image is embedded once, however often it is painted.
-    let mut images: HashMap<*const crate::image::LoadedImage, Embedded> = HashMap::new();
+    let mut images = EmbeddedObjects::new();
     let page_filter = if no_filter { None } else { Some(StreamFilter::Deflate) };
     let mut svg_writer = crate::svg::SvgWriter::new(page_filter);
     svg_writer.set_color_glyphs(color_glyphs.clone());
@@ -1134,7 +1241,10 @@ fn write_pdf_to<W: Write>(
     // own, which come after it, so the last one is written first.
     for index in (0..print_pages.islands.len()).rev() {
         let mut island = std::mem::take(&mut print_pages.islands[index]);
-        embed_images(&mut context, &mut island.display_list, &mut images, &mut svg_writer);
+        embed_items(
+            &mut context, island.display_list.items(), &mut images, &mut svg_writer,
+            page_filter, &font_map, &usage, &color_glyphs,
+        );
         let (width, height) = (island.width, island.height);
         let form = context.write_form(
             [Pt(0.0), Pt(0.0), Pt::from(width), Pt::from(height)],
@@ -1160,7 +1270,10 @@ fn write_pdf_to<W: Write>(
         svg_writer.add_island(index as u64, form);
     }
     for page in &mut print_pages.pages {
-        embed_images(&mut context, &mut page.display_list, &mut images, &mut svg_writer);
+        embed_items(
+            &mut context, page.display_list.items(), &mut images, &mut svg_writer,
+            page_filter, &font_map, &usage, &color_glyphs,
+        );
     }
 
     log::info!("Write {} pages.", print_pages.pages.len());
@@ -1399,10 +1512,17 @@ pub(crate) fn emit_path(
     path: &[display_list::PathSegment],
     page_height: PixelLength,
 ) -> Result<(), Error> {
+    emit_path_with(page_context, path.iter().copied(), |p| (Pt::from(p.x), Pt::from(page_height - p.y)))
+}
+
+pub(crate) fn emit_path_with(
+    page_context: &mut PageContext<'_, '_, '_>,
+    path: impl IntoIterator<Item = display_list::PathSegment>,
+    pt: impl Fn(display_list::Point) -> (Pt, Pt),
+) -> Result<(), Error> {
     use display_list::PathSegment;
-    let pt = |p: display_list::Point| (Pt::from(p.x), Pt::from(page_height - p.y));
     for segment in path {
-        match *segment {
+        match segment {
             PathSegment::MoveTo(p) => {
                 let (x, y) = pt(p);
                 page_context.move_to(x, y)?

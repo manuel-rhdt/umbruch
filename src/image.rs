@@ -27,6 +27,45 @@ pub struct SvgImage {
     /// The `<svg>` element of a page has no `viewBox`: a box of another size than the one of its
     /// attributes only changes the viewport, the contents are neither scaled nor moved.
     pub unscaled: bool,
+    subscene: std::sync::OnceLock<Option<Arc<crate::display_list::Subscene>>>,
+}
+
+impl SvgImage {
+    fn new(tree: usvg::Tree, unscaled: bool) -> Self {
+        Self { tree, unscaled, subscene: Default::default() }
+    }
+
+    pub(crate) fn prepare_subscene(&self) -> Option<Arc<crate::display_list::Subscene>> {
+        use crate::display_list::{Subscene, svg_paths};
+        use crate::style::properties::computed::PixelLength;
+        self.subscene.get_or_init(|| {
+            let items = svg_paths::scene(&self.tree)?;
+            let (width, height) = self.viewport_size();
+            Some(Arc::new(Subscene { width: PixelLength(width), height: PixelLength(height), items }))
+        }).clone()
+    }
+
+    pub(crate) fn viewport_size(&self) -> (f32, f32) {
+        if self.unscaled {
+            // The placement clip supplies the viewport for inline SVGs without a viewBox.
+            (1.0e5, 1.0e5)
+        } else {
+            (self.tree.size().width(), self.tree.size().height())
+        }
+    }
+
+    /// The scale and top-left origin of the SVG inside its CSS box.
+    pub(crate) fn placement(&self, rect: crate::display_list::Rect) -> (f32, crate::display_list::Point) {
+        if self.unscaled {
+            return (1.0, crate::display_list::Point::new(rect.x, rect.y));
+        }
+        let size = self.tree.size();
+        let scale = (rect.width.0 / size.width()).min(rect.height.0 / size.height());
+        use crate::style::properties::computed::PixelLength;
+        let x = rect.x + PixelLength((rect.width.0 - size.width() * scale) / 2.0);
+        let y = rect.y + PixelLength((rect.height.0 - size.height() * scale) / 2.0);
+        (scale, crate::display_list::Point::new(x, y))
+    }
 }
 
 impl std::fmt::Debug for SvgImage {
@@ -52,7 +91,7 @@ impl LoadedImage {
         }
         let text = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&data);
         if text.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'<') {
-            return parse_svg(&data, base_dir, fonts).map(|tree| LoadedImage::Svg(SvgImage { tree, unscaled: false }));
+            return parse_svg(&data, base_dir, fonts).map(|tree| LoadedImage::Svg(SvgImage::new(tree, false)));
         }
         Err("only JPEG, PNG and SVG images are supported".to_owned())
     }
@@ -120,7 +159,7 @@ pub fn svg_from_dom(
     options.font_size = font_size;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| usvg::Tree::from_xml(document, &options)))
         .map_err(|_| "the SVG image could not be processed".to_owned())?
-        .map(|tree| LoadedImage::Svg(SvgImage { tree, unscaled }))
+        .map(|tree| LoadedImage::Svg(SvgImage::new(tree, unscaled)))
         .map_err(|error| format!("invalid SVG image: {}", error))
 }
 

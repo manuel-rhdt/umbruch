@@ -794,7 +794,7 @@ impl Gradient<LengthPercentage, Color> {
 // ---------------------------------------------------------------------------------------------
 // resolving against the box
 
-/// The box a gradient is painted into (the padding box).
+/// A rectangle used to position or paint a gradient.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct BoxSize {
     pub x: f32,
@@ -803,7 +803,7 @@ pub struct BoxSize {
     pub height: f32,
 }
 
-/// Where a gradient goes in the space of the page (y pointing down).
+/// Gradient geometry in the current drawing coordinates (y pointing down).
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Geometry {
     /// Offset 0 is at `start` and offset 1 at `end`.
@@ -815,8 +815,7 @@ pub enum Geometry {
     Conic { center: (f32, f32), from: f32, radius: f32 },
 }
 
-/// A colour stop at `offset` along the gradient, with straight (not premultiplied) components
-/// in `0..=1`.
+/// A colour stop at `offset` along the gradient, in straight extended sRGB.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct ResolvedStop {
     pub offset: f32,
@@ -826,8 +825,8 @@ pub struct ResolvedStop {
 /// A gradient for a given box, ready to be painted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
-    /// The box that the gradient has to cover: the border box, which is larger than the box
-    /// that positions the gradient when there is a border.
+    /// The bounds that the gradient has to cover. This can be larger than the box
+    /// used to position a CSS background gradient.
     pub paint: BoxSize,
     pub geometry: Geometry,
     /// Offsets are increasing in `0..=1`; with `Linear` and `Radial` the colours outside are the

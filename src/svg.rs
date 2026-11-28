@@ -29,10 +29,12 @@ use lemon_pdf::mesh::{FreeFormMesh, Vertex};
 use lemon_pdf::stream::StreamFilter;
 use lemon_pdf::content::PageContext;
 use lemon_pdf::{DocumentContext, Matrix, Pt};
-use usvg::tiny_skia_path::{self, PathSegment};
+use usvg::tiny_skia_path;
 use usvg::{Node, Transform};
 
-use crate::image::RasterImage;
+use crate::display_list::{PathStroke, svg_paths};
+use crate::display_list::svg_paths::is_line;
+use crate::image::{RasterImage, SvgImage};
 
 /// The most repetitions of a gradient that are written out (spread methods `repeat` and
 /// `reflect`).
@@ -161,63 +163,28 @@ fn concat(c: &mut PageContext<'_, '_, '_>, t: Transform) -> Result<()> {
     c.concatenate_matrix(m[0], m[1], m[2], m[3], Pt(m[4]), Pt(m[5]))
 }
 
-/// Adds the segments of `path` (transformed by `t`) to the current path.
 fn emit_path(c: &mut PageContext<'_, '_, '_>, path: &tiny_skia_path::Path, t: Transform) -> Result<()> {
-    let mut current = tiny_skia_path::Point::zero();
-    for segment in path.segments() {
-        match segment {
-            PathSegment::MoveTo(p) => {
-                let (x, y) = map(t, p.x, p.y);
-                c.move_to(x, y)?;
-                current = p;
-            }
-            PathSegment::LineTo(p) => {
-                let (x, y) = map(t, p.x, p.y);
-                c.line_to(x, y)?;
-                current = p;
-            }
-            PathSegment::QuadTo(q, p) => {
-                // a quadratic curve is a cubic one with the control points two thirds of the
-                // way to the single control point
-                let third = |from: f32, to: f32| from + (to - from) * 2.0 / 3.0;
-                let (x1, y1) = map(t, third(current.x, q.x), third(current.y, q.y));
-                let (x2, y2) = map(t, third(p.x, q.x), third(p.y, q.y));
-                let (x3, y3) = map(t, p.x, p.y);
-                c.curve_to(x1, y1, x2, y2, x3, y3)?;
-                current = p;
-            }
-            PathSegment::CubicTo(a, b, p) => {
-                let (x1, y1) = map(t, a.x, a.y);
-                let (x2, y2) = map(t, b.x, b.y);
-                let (x3, y3) = map(t, p.x, p.y);
-                c.curve_to(x1, y1, x2, y2, x3, y3)?;
-                current = p;
-            }
-            PathSegment::Close => c.close_path()?,
-        }
-    }
-    Ok(())
+    crate::pdf::emit_path_with(c, svg_paths::segments(path, t), scene_point)
 }
 
-/// Whether the path is made of straight segments that all lie on one line, so that it encloses
-/// nothing. (Some viewers paint a hairline for the fill of such a path.)
-fn is_line(path: &tiny_skia_path::Path) -> bool {
-    let mut points = path.points().iter().copied();
-    let Some(first) = points.next() else {
-        return true;
-    };
-    if path.segments().any(|segment| matches!(segment, PathSegment::QuadTo(..) | PathSegment::CubicTo(..))) {
-        return false;
+fn scene_point(p: crate::display_list::Point) -> (Pt, Pt) {
+    (Pt(f64::from(p.x.0)), Pt(f64::from(p.y.0)))
+}
+
+pub(crate) fn pdf_line_cap(cap: usvg::LineCap) -> LineCap {
+    match cap {
+        usvg::LineCap::Butt => LineCap::Butt,
+        usvg::LineCap::Round => LineCap::Round,
+        usvg::LineCap::Square => LineCap::ProjectingSquare,
     }
-    let Some(second) = points.clone().find(|p| *p != first) else {
-        return true;
-    };
-    let (dx, dy) = (second.x - first.x, second.y - first.y);
-    let length_squared = dx * dx + dy * dy;
-    points.all(|p| {
-        let cross = dx * (p.y - first.y) - dy * (p.x - first.x);
-        cross * cross <= 1e-10 * length_squared * length_squared
-    })
+}
+
+pub(crate) fn pdf_line_join(join: usvg::LineJoin) -> LineJoin {
+    match join {
+        usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => LineJoin::Miter,
+        usvg::LineJoin::Round => LineJoin::Round,
+        usvg::LineJoin::Bevel => LineJoin::Bevel,
+    }
 }
 
 fn fill_rule(rule: usvg::FillRule) -> FillRule {
@@ -386,43 +353,30 @@ impl SvgWriter {
     }
 
     /// Sets the line width, caps, joins and dashes of a stroke.
-    fn set_stroke_style(&mut self, c: &mut PageContext<'_, '_, '_>, stroke: &usvg::Stroke) -> Result<()> {
-        let state = self.state();
-        let width = stroke.width().get();
-        if state.width != Some(width) {
-            state.width = Some(width);
+    fn set_stroke_style(
+        &mut self, c: &mut PageContext<'_, '_, '_>, stroke: PathStroke, dashes: &[f32], offset: f32,
+    ) -> Result<()> {
+        let width = stroke.width.0;
+        if self.state().width != Some(width) {
+            self.state().width = Some(width);
             c.line_width(Pt(f64::from(width)))?;
         }
-        let state = self.state();
-        if state.cap != Some(stroke.linecap()) {
-            state.cap = Some(stroke.linecap());
-            c.line_cap(match stroke.linecap() {
-                usvg::LineCap::Butt => LineCap::Butt,
-                usvg::LineCap::Round => LineCap::Round,
-                usvg::LineCap::Square => LineCap::ProjectingSquare,
-            })?;
+        if self.state().cap != Some(stroke.cap) {
+            self.state().cap = Some(stroke.cap);
+            c.line_cap(pdf_line_cap(stroke.cap))?;
         }
-        let state = self.state();
-        if state.join != Some(stroke.linejoin()) {
-            state.join = Some(stroke.linejoin());
-            c.line_join(match stroke.linejoin() {
-                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => LineJoin::Miter,
-                usvg::LineJoin::Round => LineJoin::Round,
-                usvg::LineJoin::Bevel => LineJoin::Bevel,
-            })?;
+        if self.state().join != Some(stroke.join) {
+            self.state().join = Some(stroke.join);
+            c.line_join(pdf_line_join(stroke.join))?;
         }
-        let state = self.state();
-        let miter = stroke.miterlimit().get();
-        if state.miter != Some(miter) {
-            state.miter = Some(miter);
-            c.miter_limit(f64::from(miter))?;
+        if self.state().miter != Some(stroke.miter_limit) {
+            self.state().miter = Some(stroke.miter_limit);
+            c.miter_limit(f64::from(stroke.miter_limit))?;
         }
-        let state = self.state();
-        let dash = (stroke.dasharray().map(<[f32]>::to_vec).unwrap_or_default(), stroke.dashoffset());
-        if state.dash.as_ref() != Some(&dash) {
-            let dashes: Vec<Pt> = dash.0.iter().map(|&d| Pt(f64::from(d))).collect();
-            c.dash_pattern(&dashes, Pt(f64::from(dash.1)))?;
-            state.dash = Some(dash);
+        if !self.state().dash.as_ref().is_some_and(|(known, phase)| known == dashes && *phase == offset) {
+            let pattern: Vec<Pt> = dashes.iter().map(|&d| Pt(f64::from(d))).collect();
+            c.dash_pattern(&pattern, Pt(f64::from(offset)))?;
+            self.state().dash = Some((dashes.to_vec(), offset));
         }
         Ok(())
     }
@@ -438,13 +392,10 @@ impl SvgWriter {
     pub fn write(
         &mut self,
         context: &mut DocumentContext<'_>,
-        tree: &usvg::Tree,
-        unscaled: bool,
+        image: &SvgImage,
     ) -> Result<FormReference> {
-        let size = tree.size();
-        // (the viewport of an element without a `viewBox` is the box that it is in, which the
-        // page clips to: the form does not cut at the size of its attributes)
-        let (width, height) = if unscaled { (1.0e5, 1.0e5) } else { (size.width(), size.height()) };
+        let tree = &image.tree;
+        let (width, height) = image.viewport_size();
         let bbox = [Pt(0.0), Pt(0.0), Pt(f64::from(width)), Pt(f64::from(height))];
         let filter = self.filter;
         // the addresses of the objects of an earlier tree may be used again
@@ -939,7 +890,9 @@ impl SvgWriter {
                 };
                 self.set_color(c, *color, true)?;
                 self.set_alpha(c, self.alpha * f64::from(stroke.opacity().get()), true)?;
-                self.set_stroke_style(c, stroke)?;
+                self.set_stroke_style(
+                    c, svg_paths::stroke_style(stroke), stroke.dasharray().unwrap_or_default(), stroke.dashoffset(),
+                )?;
             }
             c.begin_text()?;
             c.push_operand(mode)?;
@@ -1110,7 +1063,9 @@ impl SvgWriter {
             }
         }
         self.set_alpha(c, opacity, true)?;
-        self.set_stroke_style(c, stroke)?;
+        self.set_stroke_style(
+            c, svg_paths::stroke_style(stroke), stroke.dasharray().unwrap_or_default(), stroke.dashoffset(),
+        )?;
         emit_path(c, path.data(), Transform::identity())?;
         c.stroke_path()?;
         if masked {

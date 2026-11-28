@@ -1,3 +1,4 @@
+pub(crate) mod svg_paths;
 pub mod text;
 
 use crate::layout::components::ImageBox;
@@ -480,6 +481,22 @@ pub struct ColorGlyphItem {
     pub color: PaintColor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathStroke {
+    pub width: PixelLength,
+    pub cap: usvg::LineCap,
+    pub join: usvg::LineJoin,
+    pub miter_limit: f32,
+}
+
+/// A reusable drawing in local CSS-pixel coordinates, clipped to its viewport.
+#[derive(Debug)]
+pub struct Subscene {
+    pub width: PixelLength,
+    pub height: PixelLength,
+    pub items: Box<[DisplayItem]>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
     LineString {
@@ -491,6 +508,11 @@ pub enum DisplayItem {
     FillPath {
         path: Vec<PathSegment>,
         even_odd: bool,
+    },
+    /// Strokes a path with the current stroke color.
+    StrokePath {
+        path: Vec<PathSegment>,
+        style: PathStroke,
     },
     /// Intersects the clip with the path, until the enclosing `Pop`.
     ClipPath {
@@ -505,6 +527,12 @@ pub enum DisplayItem {
     Image {
         rect: Rect,
         image: std::sync::Arc<crate::image::LoadedImage>,
+    },
+    /// Paints a drawing with a local-to-page transform and a clip in page coordinates.
+    DrawSubscene {
+        scene: std::sync::Arc<Subscene>,
+        transform: [f32; 6],
+        clip: Rect,
     },
     Color(PaintColor),
     StrokeColor(PaintColor),
@@ -697,6 +725,20 @@ impl DisplayList {
         self.items.iter().map(|elem| &elem.item)
     }
 
+    fn prepare_images(&mut self) {
+        for element in &mut self.items {
+            let DisplayItem::Image { rect, image } = &element.item else { continue };
+            let crate::image::LoadedImage::Svg(svg) = &**image else { continue };
+            let Some(scene) = svg.prepare_subscene() else { continue };
+            let (scale, origin) = svg.placement(*rect);
+            element.item = DisplayItem::DrawSubscene {
+                scene,
+                transform: [scale, 0.0, 0.0, scale, origin.x.0, origin.y.0],
+                clip: *rect,
+            };
+        }
+    }
+
     fn stroked_line(
         &mut self,
         start: Point,
@@ -876,7 +918,7 @@ impl DisplayList {
         );
         // the images are not part of the group, so they are not blended: they go over it
         let images: Vec<Layer> = layers.iter().filter(|layer| matches!(layer, Layer::Image { .. })).cloned().collect();
-        self.gradients(&images, Some(clip), entity, z);
+        self.gradients(&images, Some((clip, bbox)), entity, z);
     }
 
     /// Paints an outer `box-shadow` of the border box `rect` with the radii `radii`: below the box
@@ -987,7 +1029,7 @@ impl DisplayList {
     }
 
     /// Paints gradients, clipped to the (rounded) border box `clip`.
-    fn gradients(&mut self, gradients: &[Layer], clip: Option<&[PathSegment]>, entity: Entity, z: ZIndex) {
+    fn gradients(&mut self, gradients: &[Layer], clip: Option<(&[PathSegment], Rect)>, entity: Entity, z: ZIndex) {
         for layer in gradients {
             let layer_clip = match layer {
                 Layer::Gradient(GradientLayer { clip, .. }) | Layer::Image { clip, .. } => *clip,
@@ -995,7 +1037,7 @@ impl DisplayList {
             self.append(DisplayItem::Push, entity, z);
             self.append(
                 DisplayItem::ClipPath {
-                    path: clip.map_or_else(|| rect_path(layer_clip), |clip| clip.to_vec()),
+                    path: clip.map_or_else(|| rect_path(layer_clip), |(path, _)| path.to_vec()),
                     even_odd: false,
                 },
                 entity,
@@ -1003,7 +1045,10 @@ impl DisplayList {
             );
             match layer {
                 Layer::Gradient(GradientLayer { gradient, .. }) => {
-                    self.append(DisplayItem::Gradient(Box::new(gradient.clone())), entity, z)
+                    let mut gradient = gradient.clone();
+                    // The rounded border clip may be wider than the layer's background-clip.
+                    gradient.clip |= clip.is_some_and(|(_, bounds)| bounds != layer_clip);
+                    self.append(DisplayItem::Gradient(Box::new(gradient)), entity, z)
                 }
                 Layer::Image { image, tiles, .. } => {
                     for &rect in tiles {
@@ -1049,7 +1094,7 @@ impl DisplayList {
             self.append(DisplayItem::Pop, entity, z);
         }
         if !blended {
-            self.gradients(gradients, Some(&outer_path), entity, z);
+            self.gradients(gradients, Some((&outer_path, rect)), entity, z);
         }
 
         if border.top <= zero && border.bottom <= zero && border.left <= zero && border.right <= zero
@@ -1804,11 +1849,14 @@ pub fn generate_display_list(world: &mut specs::World) -> PrintPages {
         });
     }
 
-    let islands = if world.has_value::<IslandPages>() {
+    let mut islands = if world.has_value::<IslandPages>() {
         std::mem::take(&mut world.write_resource::<IslandPages>().0)
     } else {
         vec![]
     };
+    for page in page_vec.iter_mut().chain(&mut islands) {
+        page.display_list.prepare_images();
+    }
     PrintPages {
         islands,
         font_map: (*world.read_resource::<crate::layout::FontMap>()).clone(),

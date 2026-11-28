@@ -4,17 +4,20 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use vello_cpu::kurbo::{Affine, BezPath, Point, Rect, Stroke, Vec2};
-use vello_cpu::peniko::{Blob, Color, Fill, FontData, ImageAlphaType};
+use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke, Vec2};
+use vello_cpu::peniko::{
+    Blob, Color, ColorStop, Fill, FontData, Gradient, ImageAlphaType, InterpolationAlphaSpace,
+};
 use vello_cpu::{Glyph, Image, ImageSource, Pixmap, RenderContext, Resources};
 
 use crate::display_list::text::{PositionedGlyph, PositionedGlyphRuns};
-use crate::display_list::{DisplayItem, PathSegment, PrintPages, Rect as PageRect};
+use crate::display_list::{DisplayItem, PathSegment, PrintPages, Rect as PageRect, Subscene};
 use crate::engine::{Error, Result};
 use crate::image::LoadedImage;
 use crate::layout::FontMap;
 use crate::layout::components::Paragraph;
 use crate::style::properties::computed::{PaintColor, PixelLength};
+use crate::style::properties::gradient::{Geometry, Resolved};
 
 // An RGBA target at this limit uses 64 MiB before allocating any renderer buffers.
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
@@ -173,6 +176,27 @@ impl Painter<'_> {
                     self.ctx.push_clip_path(&bezier(path));
                     state.clips += 1;
                 }
+                DisplayItem::StrokePath { path, style } => {
+                    let cap = match style.cap {
+                        usvg::LineCap::Butt => Cap::Butt,
+                        usvg::LineCap::Round => Cap::Round,
+                        usvg::LineCap::Square => Cap::Square,
+                    };
+                    let join = match style.join {
+                        usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => Join::Miter,
+                        usvg::LineJoin::Round => Join::Round,
+                        usvg::LineJoin::Bevel => Join::Bevel,
+                    };
+                    self.ctx.set_paint(color(state.stroke));
+                    self.ctx.set_stroke(Stroke {
+                        start_cap: cap,
+                        end_cap: cap,
+                        join,
+                        miter_limit: f64::from(style.miter_limit),
+                        ..Stroke::new(f64::from(style.width.0))
+                    });
+                    self.ctx.stroke_path(&bezier(path));
+                }
                 DisplayItem::LineString { points, line_width } => {
                     if let Some((first, rest)) = points.split_first() {
                         let mut path = BezPath::new();
@@ -193,9 +217,12 @@ impl Painter<'_> {
                 // Glifo renders COLR glyphs as part of the glyph run.
                 DisplayItem::ColorGlyph(_) => {}
                 DisplayItem::Image { rect, image } => self.image(*rect, image)?,
-                DisplayItem::Gradient(_) => {
-                    self.unsupported.insert("gradients");
-                }
+                DisplayItem::DrawSubscene {
+                    scene,
+                    transform,
+                    clip,
+                } => self.subscene(scene, *transform, *clip, state.transform)?,
+                DisplayItem::Gradient(gradient) => self.gradient(gradient, state.transform),
                 DisplayItem::BlendGroup(_) => {
                     self.unsupported.insert("background blend groups");
                 }
@@ -235,10 +262,68 @@ impl Painter<'_> {
         Ok(())
     }
 
+    fn gradient(&mut self, gradient: &Resolved, to_device: Affine) {
+        if gradient.tiling.is_some() {
+            self.unsupported.insert("tiled gradient backgrounds");
+            return;
+        }
+        let point = |(x, y): (f32, f32)| Point::new(f64::from(x), f64::from(y));
+        let (mut brush, transform) = match gradient.geometry {
+            Geometry::Linear { start, end } => (
+                Gradient::new_linear(point(start), point(end)),
+                Affine::IDENTITY,
+            ),
+            Geometry::Radial { center, radius } => (
+                Gradient::new_radial(Point::ORIGIN, 1.0),
+                Affine::translate(point(center).to_vec2())
+                    * Affine::scale_non_uniform(f64::from(radius.0), f64::from(radius.1)),
+            ),
+            Geometry::Conic { center, from, .. } => (
+                Gradient::new_sweep(Point::ORIGIN, 0.0, std::f32::consts::TAU),
+                // CSS starts at the top, while a Vello sweep starts on the positive x axis.
+                Affine::translate(point(center).to_vec2())
+                    * Affine::rotate(f64::from(from).to_radians() - std::f64::consts::FRAC_PI_2),
+            ),
+        };
+        brush.stops.extend(gradient.stops.iter().map(|stop| {
+            ColorStop::from((
+                stop.offset,
+                Color::new(stop.color.map(|c| c.clamp(0.0, 1.0))),
+            ))
+        }));
+        // CSS interpolation has already been converted into stops for a straight sRGB ramp.
+        self.ctx.set_paint(
+            brush.with_interpolation_alpha_space(InterpolationAlphaSpace::Unpremultiplied),
+        );
+        self.ctx.set_paint_transform(transform);
+        self.ctx.set_fill_rule(Fill::NonZero);
+        let area = gradient.paint;
+        let mut bounds = Rect::new(
+            f64::from(area.x),
+            f64::from(area.y),
+            f64::from(area.x + area.width),
+            f64::from(area.y + area.height),
+        );
+        if !gradient.clip {
+            // Give the clip path sole responsibility for antialiasing the outline.
+            let [a, b, c, d, ..] = to_device.inverse().as_coeffs();
+            let padded = bounds.inflate(a.abs() + c.abs(), b.abs() + d.abs());
+            if padded.is_finite() {
+                bounds = padded;
+            }
+        }
+        self.ctx.fill_rect(&bounds);
+        self.ctx.set_paint_transform(Affine::IDENTITY);
+    }
+
     fn image(&mut self, bounds: PageRect, image: &LoadedImage) -> Result<()> {
-        let LoadedImage::Raster(raster) = image else {
-            self.unsupported.insert("SVG images");
-            return Ok(());
+        let raster = match image {
+            LoadedImage::Raster(raster) => raster,
+            LoadedImage::Svg(_) => {
+                self.unsupported
+                    .insert("SVG images with unsupported drawing features");
+                return Ok(());
+            }
         };
         if !raster.data.starts_with(b"\x89PNG\r\n\x1a\n") {
             self.unsupported.insert("JPEG images");
@@ -272,6 +357,29 @@ impl Painter<'_> {
         self.ctx.fill_rect(&bounds);
         self.ctx.set_paint_transform(Affine::IDENTITY);
         Ok(())
+    }
+
+    fn subscene(
+        &mut self,
+        scene: &Subscene,
+        transform: [f32; 6],
+        clip: PageRect,
+        parent: Affine,
+    ) -> Result<()> {
+        let to_page = parent * Affine::new(transform.map(f64::from));
+        self.ctx.push_clip_rect(&rect(clip));
+        self.ctx.set_transform(to_page);
+        self.ctx.push_clip_rect(&Rect::new(
+            0.0,
+            0.0,
+            f64::from(scene.width.0),
+            f64::from(scene.height.0),
+        ));
+        let result = self.paint(scene.items.iter(), to_page);
+        self.ctx.pop_clip();
+        self.ctx.pop_clip();
+        self.ctx.set_transform(parent);
+        result
     }
 }
 
