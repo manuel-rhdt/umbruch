@@ -1,3 +1,5 @@
+pub mod text;
+
 use crate::layout::components::ImageBox;
 use crate::layout::components::{
     Decoration, DecorationFragment, EdgeValues, GraphicsOp, Hyperlink, Hyperlinks, Paragraph, Position, TextOperator,

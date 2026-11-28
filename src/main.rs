@@ -27,6 +27,14 @@ struct Options {
     /// error. The other things that PDF/A forbids are not checked.
     #[structopt(long = "pdfa", value_name = "LEVEL")]
     pdfa: Option<PdfALevel>,
+    /// Write this page as PNG (page numbers start at one).
+    #[cfg(feature = "png-output")]
+    #[structopt(long, value_name = "NUMBER", conflicts_with_all = &["serve", "pdfa", "no-tags", "no-filter"])]
+    png_page: Option<usize>,
+    /// Resolution of PNG output (default: 96 DPI).
+    #[cfg(feature = "png-output")]
+    #[structopt(long, value_name = "DPI", requires = "png-page")]
+    png_dpi: Option<u32>,
     /// Write the computed layout as JSON to this file (use `-` for stdout)
     #[structopt(long = "dump-layout", parse(from_os_str))]
     dump_layout: Option<PathBuf>,
@@ -70,7 +78,7 @@ struct Options {
     /// Use `-` for standard input.
     #[structopt(parse(from_os_str), required_unless = "serve")]
     input: Option<PathBuf>,
-    /// Path where the output PDF file will be stored. Use `-` for standard output.
+    /// Path where the rendered file will be stored. Use `-` for standard output.
     #[structopt(parse(from_os_str), required_unless = "serve")]
     output: Option<PathBuf>,
 }
@@ -112,7 +120,7 @@ fn main() -> Result<(), Error> {
     let to_stdout = output.as_os_str() == "-";
     let stdout_is_dump = [&opt.dump_layout, &opt.dump_pagination].iter().any(|p| p.as_ref().is_some_and(|p| p.as_os_str() == "-"));
     if to_stdout && (stdout_is_dump || opt.check_layout) {
-        eprintln!("error: the PDF is written to standard output, which the other output cannot share");
+        eprintln!("error: the rendered file is written to standard output, which the other output cannot share");
         std::process::exit(2);
     }
 
@@ -152,7 +160,7 @@ fn main() -> Result<(), Error> {
     };
 
     layout::report_pagination(opt.dump_pagination.is_some());
-    let mut layout = engine
+    let layout = engine
         .layout(&document, &render_options.layout)
         .map_err(|e| Error::Layout(e.to_string()))?;
 
@@ -200,18 +208,29 @@ fn main() -> Result<(), Error> {
         None
     };
 
-    // (the file is made only once the PDF is complete, so there is none for a document that cannot be written)
-    let mut pdf = Vec::new();
-    if let Err(error) = layout.write_pdf(&render_options, &mut pdf) {
+    // Make the file only once rendering is complete.
+    let write_pdf = |mut layout: umbruch::engine::LayoutResult| -> umbruch::engine::Result<Vec<u8>> {
+        let mut pdf = Vec::new();
+        layout.write_pdf(&render_options, &mut pdf)?;
+        Ok(pdf)
+    };
+    #[cfg(feature = "png-output")]
+    let result = match opt.png_page {
+        Some(page) => layout.into_png(page, opt.png_dpi.unwrap_or(96)),
+        None => write_pdf(layout),
+    };
+    #[cfg(not(feature = "png-output"))]
+    let result = write_pdf(layout);
+    let bytes = result.unwrap_or_else(|error| {
         eprintln!("error: {error}");
         std::process::exit(1);
-    }
+    });
     if to_stdout {
         let mut out = std::io::stdout().lock();
-        out.write_all(&pdf)?;
+        out.write_all(&bytes)?;
         out.flush()?;
     } else {
-        std::fs::write(&output, &pdf)?;
+        std::fs::write(&output, &bytes)?;
     }
 
     if let Some(code) = check_exit_code {

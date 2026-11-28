@@ -28,6 +28,8 @@ pub mod metadata;
 pub mod node_data_ref;
 mod parser;
 pub mod pdf;
+#[cfg(feature = "png-output")]
+mod raster;
 pub mod server;
 pub mod simple_dom;
 pub mod style;

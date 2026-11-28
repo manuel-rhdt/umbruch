@@ -41,6 +41,7 @@ unicode-vo = "0.1"
 unicode-segmentation = "1.13.3"
 usvg = { path = "svg" }
 png = "0.18.1"
+vello_cpu = { version = "0.4", optional = true }
 unicode-properties = { version = "0.1.5", default-features = false, features = ["emoji", "general-category"] }
 
 # Finding an installed font for characters that the fonts of `font-family` lack
@@ -49,6 +50,8 @@ yeslogic-fontconfig-sys = { version = "6", optional = true }
 
 [features]
 default = ["fontconfig", "embedded-fonts"]
+# Experimental PNG output through the CPU renderer.
+png-output = ["dep:vello_cpu"]
 # Ask fontconfig for the default generic families and for fallback fonts on Linux/BSD. Disable
 # for fully static (musl) builds, which can't link the system's fontconfig; installed fonts are
 # then found by scanning the font directories only.
