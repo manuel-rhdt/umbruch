@@ -93,6 +93,26 @@ base_dir?}`), announced by the capability `stylesheet`.
 This list describes what the code supports. Anything not listed is not supported; the open
 issues track the known gaps. Unsupported declarations are logged (`RUST_LOG=warn`) and ignored.
 
+### Experimental PNG output
+
+Build with the `png-output` feature and use `--png-page` to choose a page (starting at one):
+
+```sh
+cargo run --features png-output -- --png-page 1 --png-dpi 144 input.html output.png
+```
+
+The PNG renderer takes the same laid-out pages as the PDF writer and paints with Vello CPU. It
+supports shaped text, solid fills, paths, clipping, transforms, opacity groups and PNG images.
+CSS linear, radial and conic gradients, including the `repeating-*` functions, use the same
+resolved geometry and colour stops as PDF output. PNG clips wide-gamut stops to sRGB.
+SVG paths with opaque solid paint or sRGB gradient fills are prepared as reusable subscenes of
+regular drawing commands. The shared path supports padded linear and centered radial fills,
+undashed solid strokes, transforms and single-path clips. Tiled gradient backgrounds,
+background blend groups, other SVG images and JPEG images are skipped with a warning
+(`RUST_LOG=warn`). PNG output defaults to 96 DPI and uses a
+transparent background wherever the document leaves the page unpainted. `--crop` and `-` for
+standard output also work.
+
 ## HTML
 
 - **Parsing:** HTML5 (`html5ever`), `lang` and `dir`, `<title>`.

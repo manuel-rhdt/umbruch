@@ -30,7 +30,7 @@ pub enum Error {
     Parse(String),
     /// The document could not be laid out.
     Layout(String),
-    /// The PDF could not be written.
+    /// The output could not be written.
     Render(String),
 }
 
@@ -311,10 +311,26 @@ impl LayoutResult {
         layout::check::check_layout(&self.dom, &self.context)
     }
 
+    /// Collects the laid-out pages for painting. This consumes text and SVG layout data.
+    pub fn into_print_pages(mut self) -> display_list::PrintPages {
+        self.collect_print_pages()
+    }
+
+    fn collect_print_pages(&mut self) -> display_list::PrintPages {
+        display_list::generate_display_list(&mut self.context)
+    }
+
+    /// Renders one page (numbered from one) as PNG using the experimental raster backend.
+    #[cfg(feature = "png-output")]
+    pub fn into_png(self, page: usize, dpi: u32) -> Result<Vec<u8>> {
+        let crop = self.crop;
+        crate::raster::render_png(self.into_print_pages(), page, crop, dpi)
+    }
+
     /// Writes the pages as PDF. Returns the number of pages and the size of the first one in points.
     pub fn write_pdf<W: Write>(&mut self, options: &RenderOptions, output: W) -> Result<(usize, Option<(f32, f32)>)> {
         options.check()?;
-        let pages = display_list::generate_display_list(&mut self.context);
+        let pages = self.collect_print_pages();
         let count = pages.pages.len();
         let size = pages.pages.first().map(|page| {
             let (w, h) = if self.crop { (page.content_rect.width, page.content_rect.height) } else { (page.width, page.height) };
